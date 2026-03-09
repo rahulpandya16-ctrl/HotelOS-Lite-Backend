@@ -1458,6 +1458,53 @@ app.post("/api/ota/webhook", async (req, res) => {
   }
 });
 
+// ==========================================
+// 🔐 SUBSCRIPTION & LICENSE CHECK API
+// ==========================================
+app.get("/api/check-license", async (req, res) => {
+  // Client app yahan apna hotel_id bhejega
+  const clientHotelId = req.hotel_id;
+
+  try {
+    const result = await pool.query(
+      "SELECT * FROM subscriptions WHERE hotel_id = $1",
+      [clientHotelId],
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({
+        status: "expired",
+        warning: "❌ Invalid Hotel ID! Contact Admin.",
+        days_left: 0,
+      });
+    }
+
+    const sub = result.rows[0];
+    const today = new Date();
+    const expiry = new Date(sub.expiry_date);
+    const diffTime = expiry - today;
+    const daysLeft = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+    if (daysLeft < 0 || sub.status === "INACTIVE") {
+      return res.json({
+        status: "expired",
+        warning: "❌ Software License Expired! Please Renew.",
+        days_left: 0,
+      });
+    }
+
+    // Sab theek hai! App chalu rakho.
+    res.json({
+      status: "active",
+      days_left: daysLeft,
+      expiry_date: sub.expiry_date,
+      warning: daysLeft < 7 ? `⚠️ License expires in ${daysLeft} days!` : "",
+    });
+  } catch (err) {
+    res.json({ status: "expired", warning: "Server Error checking license." });
+  }
+});
+
 // Health Check for Render
 app.get("/", (req, res) => {
   res.send("<h1>🚀 HotelOS Master Cloud API is LIVE!</h1>");

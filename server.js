@@ -1505,6 +1505,58 @@ app.get("/api/check-license", async (req, res) => {
   }
 });
 
+// ==========================================
+// 🚀 EMERGENCY MAGIC SETUP (Bypass Supabase SQL Error)
+// ==========================================
+app.get("/setup-demo-data", async (req, res) => {
+  try {
+    // 1. License Table banayega aur aapka ID active karega
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS subscriptions (
+        hotel_id VARCHAR(100) PRIMARY KEY,
+        expiry_date DATE,
+        status VARCHAR(20) DEFAULT 'ACTIVE'
+      );
+    `);
+
+    await pool.query(`
+      INSERT INTO subscriptions (hotel_id, expiry_date) 
+      VALUES ('HOTEL_INDORE_1728', '2027-03-10')
+      ON CONFLICT (hotel_id) DO UPDATE SET expiry_date = '2027-03-10';
+    `);
+
+    // 2. Puraana khali data saaf karega
+    await pool.query(`DELETE FROM rooms WHERE hotel_id = 'HOTEL_INDORE_1728'`);
+    await pool.query(`DELETE FROM tables WHERE hotel_id = 'HOTEL_INDORE_1728'`);
+
+    // 3. Naye Rooms dalega
+    await pool.query(`
+      INSERT INTO rooms (hotel_id, room_no, type, price, status) VALUES 
+      ('HOTEL_INDORE_1728', '101', 'AC', 2000, 'VACANT'),
+      ('HOTEL_INDORE_1728', '102', 'Non-AC', 1500, 'VACANT'),
+      ('HOTEL_INDORE_1728', '103', 'Deluxe', 3000, 'VACANT');
+    `);
+
+    // 4. Nayi Tables dalega
+    await pool.query(`
+      INSERT INTO tables (hotel_id, table_no, status) VALUES 
+      ('HOTEL_INDORE_1728', 'T1', 'AVAILABLE'),
+      ('HOTEL_INDORE_1728', 'T2', 'AVAILABLE'),
+      ('HOTEL_INDORE_1728', 'P-1', 'AVAILABLE');
+    `);
+
+    res.send(
+      "<h1 style='color:green; text-align:center; margin-top:50px;'>✅ SUCCESS! Saara data apne aap set ho gaya! Ab apna Mobile App open karo.</h1>",
+    );
+  } catch (err) {
+    res.send(
+      "<h1 style='color:red; text-align:center; margin-top:50px;'>❌ Error: " +
+        err.message +
+        "</h1>",
+    );
+  }
+});
+
 // Health Check for Render
 app.get("/", (req, res) => {
   res.send("<h1>🚀 HotelOS Master Cloud API is LIVE!</h1>");

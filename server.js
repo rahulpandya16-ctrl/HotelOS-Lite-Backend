@@ -801,6 +801,663 @@ app.get("/api/reports/daily_bills", async (req, res) => {
   }
 });
 
+// ==========================================
+// 📦 12. INVENTORY & VENDORS API
+// ==========================================
+
+app.get("/api/inventory", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM inventory_items WHERE hotel_id = $1 ORDER BY item_name ASC",
+      [req.hotel_id],
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json([]);
+  }
+});
+
+app.get("/api/vendors", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM vendors WHERE hotel_id = $1 ORDER BY name ASC",
+      [req.hotel_id],
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json([]);
+  }
+});
+
+app.post("/api/inventory/add", async (req, res) => {
+  const {
+    item_id,
+    quantity,
+    vendor_id,
+    price_per_unit,
+    gst_percent,
+    gst_amount,
+    total_bill_amount,
+  } = req.body;
+  const date = new Date().toISOString().split("T")[0];
+
+  try {
+    await pool.query("BEGIN"); // Transaction Start
+
+    // 1. Stock Update
+    await pool.query(
+      "UPDATE inventory_items SET current_stock = current_stock + $1, price_per_unit = $2 WHERE id = $3 AND hotel_id = $4",
+      [quantity, price_per_unit, item_id, req.hotel_id],
+    );
+
+    // 2. Vendor Balance Update
+    await pool.query(
+      "UPDATE vendors SET balance = balance + $1 WHERE id = $2 AND hotel_id = $3",
+      [total_bill_amount || quantity * price_per_unit, vendor_id, req.hotel_id],
+    );
+
+    // 3. Stock Log
+    await pool.query(
+      `INSERT INTO stock_logs (hotel_id, item_id, type, quantity, price_at_time, vendor_id, date, remarks, gst_percent, gst_amount, total_bill_amount) 
+       VALUES ($1, $2, 'IN', $3, $4, $5, $6, 'Purchase', $7, $8, $9)`,
+      [
+        req.hotel_id,
+        item_id,
+        quantity,
+        price_per_unit,
+        vendor_id,
+        date,
+        gst_percent || 0,
+        gst_amount || 0,
+        total_bill_amount || quantity * price_per_unit,
+      ],
+    );
+
+    await pool.query("COMMIT");
+    res.json({ success: true, message: "Purchase Saved!" });
+  } catch (err) {
+    await pool.query("ROLLBACK");
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/inventory/consume", async (req, res) => {
+  const { item_id, quantity, remarks } = req.body;
+  const date = new Date().toISOString().split("T")[0];
+
+  try {
+    await pool.query(
+      "UPDATE inventory_items SET current_stock = current_stock - $1 WHERE id = $2 AND hotel_id = $3",
+      [quantity, item_id, req.hotel_id],
+    );
+    await pool.query(
+      "INSERT INTO stock_logs (hotel_id, item_id, type, quantity, date, remarks) VALUES ($1, $2, 'OUT', $3, $4, $5)",
+      [req.hotel_id, item_id, quantity, date, remarks || "Kitchen Use"],
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================
+// 💸 13. EXPENSES & PETTY CASH (CA MODULE)
+// ==========================================
+
+app.post("/api/expenses/add", async (req, res) => {
+  const { date, category, amount, payment_mode, remarks, added_by } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO expenses (hotel_id, date, category, amount, payment_mode, remarks, added_by) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+      [
+        req.hotel_id,
+        date,
+        category,
+        amount,
+        payment_mode || "CASH",
+        remarks || "",
+        added_by || "Admin",
+      ],
+    );
+    res.json({
+      success: true,
+      message: "Expense Added Successfully!",
+      id: result.rows[0].id,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.get("/api/expenses", async (req, res) => {
+  const { from, to } = req.query;
+  try {
+    let sql =
+      "SELECT * FROM expenses WHERE hotel_id = $1 ORDER BY date DESC, id DESC LIMIT 500";
+    let params = [req.hotel_id];
+
+    if (from && to) {
+      sql =
+        "SELECT * FROM expenses WHERE hotel_id = $1 AND date >= $2 AND date <= $3 ORDER BY date DESC, id DESC";
+      params = [req.hotel_id, from, to];
+    }
+    const result = await pool.query(sql, params);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json([]);
+  }
+});
+
+// ==========================================
+// 🛠️ 14. ADVANCED TABLES (Auto-Setup)
+// ==========================================
+async function initializeAdvancedTables() {
+  const sql = `
+    CREATE TABLE IF NOT EXISTS inventory_items (
+      id SERIAL PRIMARY KEY, hotel_id VARCHAR(100), item_name TEXT, item_name_local TEXT DEFAULT '',
+      category TEXT, unit TEXT, current_stock REAL, min_stock_level REAL, price_per_unit REAL DEFAULT 0, gst_rate REAL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS vendors (
+      id SERIAL PRIMARY KEY, hotel_id VARCHAR(100), name TEXT, mobile TEXT, address TEXT, gst_number TEXT, balance REAL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS stock_logs (
+      id SERIAL PRIMARY KEY, hotel_id VARCHAR(100), item_id INTEGER, type TEXT, quantity REAL, price_at_time REAL, 
+      vendor_id INTEGER, date TEXT, remarks TEXT, gst_percent REAL DEFAULT 0, gst_amount REAL DEFAULT 0, total_bill_amount REAL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS attendance (
+      id SERIAL PRIMARY KEY, hotel_id VARCHAR(100), staff_id INTEGER, name TEXT, date TEXT, in_time TEXT, out_time TEXT, status TEXT, selfie_path TEXT
+    );
+    CREATE TABLE IF NOT EXISTS payroll (
+      id SERIAL PRIMARY KEY, hotel_id VARCHAR(100), staff_id INTEGER, month_year TEXT, base_salary REAL, 
+      present_days REAL, earned_amount REAL, advance_deducted REAL, final_payout REAL, payment_date TEXT
+    );
+    CREATE TABLE IF NOT EXISTS staff_advances (
+      id SERIAL PRIMARY KEY, hotel_id VARCHAR(100), staff_id INTEGER, amount REAL, date TEXT, reason TEXT, paid INTEGER DEFAULT 0, is_deducted INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS clients (
+      id SERIAL PRIMARY KEY, hotel_id VARCHAR(100), name TEXT, mobile TEXT UNIQUE, address TEXT, aadhar TEXT, id_proof TEXT DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS client_history (
+      id SERIAL PRIMARY KEY, hotel_id VARCHAR(100), client_mobile TEXT, type TEXT, details TEXT, amount REAL, date TEXT
+    );
+    CREATE TABLE IF NOT EXISTS delivery_partners (
+      id SERIAL PRIMARY KEY, hotel_id VARCHAR(100), name TEXT UNIQUE, api_key TEXT, status INTEGER DEFAULT 1
+    );
+  `;
+  try {
+    await pool.query(sql);
+    console.log("✅ Advanced Tables (HR, Inventory, Clients) Created!");
+  } catch (err) {
+    console.error("❌ Advanced Table Error:", err.message);
+  }
+}
+initializeAdvancedTables();
+
+// ==========================================
+// 👨‍💼 15. STAFF, ATTENDANCE & PAYROLL
+// ==========================================
+
+// Time calculation helper for Salary
+function parseTime(timeStr) {
+  if (!timeStr) return 0;
+  const parts = timeStr.split(" ");
+  const [time, modifier] = parts;
+  if (!time) return 0;
+  let [hours, minutes] = time.split(":");
+  hours = parseInt(hours);
+  minutes = parseInt(minutes);
+  if (parts.length > 1) {
+    if (hours === 12) hours = 0;
+    if (modifier === "PM") hours += 12;
+  }
+  return hours * 60 + minutes;
+}
+
+app.post("/api/mark_attendance", async (req, res) => {
+  const { staff_id } = req.body;
+  const date = new Date().toISOString().split("T")[0];
+  const time = new Date().toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "numeric",
+    hour12: true,
+  });
+
+  try {
+    const userRes = await pool.query(
+      "SELECT name FROM users WHERE id = $1 AND hotel_id = $2",
+      [staff_id, req.hotel_id],
+    );
+    if (userRes.rows.length === 0)
+      return res.json({ status: false, message: "User not found" });
+
+    const user = userRes.rows[0];
+    const attRes = await pool.query(
+      "SELECT * FROM attendance WHERE staff_id = $1 AND date = $2 AND hotel_id = $3",
+      [staff_id, date, req.hotel_id],
+    );
+
+    if (attRes.rows.length === 0) {
+      // Clock IN
+      await pool.query(
+        "INSERT INTO attendance (hotel_id, staff_id, name, date, in_time, status) VALUES ($1, $2, $3, $4, $5, 'P')",
+        [req.hotel_id, staff_id, user.name, date, time],
+      );
+      res.json({
+        status: true,
+        type: "IN",
+        message: `✅ Clocked In at ${time}`,
+      });
+    } else {
+      // Clock OUT
+      const record = attRes.rows[0];
+      if (!record.out_time) {
+        await pool.query("UPDATE attendance SET out_time = $1 WHERE id = $2", [
+          time,
+          record.id,
+        ]);
+        res.json({
+          status: true,
+          type: "OUT",
+          message: `🛑 Clocked Out at ${time}`,
+        });
+      } else {
+        res.json({ status: false, message: "⚠️ Already Clocked Out today!" });
+      }
+    }
+  } catch (err) {
+    res.json({ status: false, message: err.message });
+  }
+});
+
+app.get("/api/attendance_history", async (req, res) => {
+  const { month, staff_id } = req.query;
+  try {
+    let sql =
+      "SELECT * FROM attendance WHERE hotel_id = $1 AND date LIKE $2 ORDER BY date DESC";
+    let params = [req.hotel_id, `${month}%`];
+
+    if (staff_id && staff_id !== "null") {
+      sql =
+        "SELECT * FROM attendance WHERE hotel_id = $1 AND date LIKE $2 AND staff_id = $3 ORDER BY date DESC";
+      params.push(staff_id);
+    }
+    const result = await pool.query(sql, params);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json([]);
+  }
+});
+
+app.post("/api/add_advance", async (req, res) => {
+  const { staff_id, amount, date, reason } = req.body;
+  try {
+    await pool.query(
+      "INSERT INTO staff_advances (hotel_id, staff_id, amount, date, reason) VALUES ($1, $2, $3, $4, $5)",
+      [req.hotel_id, staff_id, amount, date, reason || "Advance"],
+    );
+    res.json({ status: true, message: "Advance Added" });
+  } catch (err) {
+    res.json({ status: false, message: err.message });
+  }
+});
+
+app.get("/api/calculate_salary", async (req, res) => {
+  const { staff_id, month } = req.query;
+  try {
+    // 1. Get Settings for working hours
+    const settingsRes = await pool.query(
+      "SELECT full_day_hours, half_day_hours FROM hotel_settings WHERE hotel_id = $1",
+      [req.hotel_id],
+    );
+    const fullDayHours =
+      settingsRes.rows.length > 0 ? settingsRes.rows[0].full_day_hours : 9;
+    const halfDayHours =
+      settingsRes.rows.length > 0 ? settingsRes.rows[0].half_day_hours : 4;
+
+    // 2. Get User Salary
+    const userRes = await pool.query(
+      "SELECT * FROM users WHERE id = $1 AND hotel_id = $2",
+      [staff_id, req.hotel_id],
+    );
+    if (userRes.rows.length === 0) return res.json(null);
+    const user = userRes.rows[0];
+    const oneDaySalary = (user.salary || 0) / 30;
+
+    // 3. Get Attendance Records
+    const attRes = await pool.query(
+      "SELECT in_time, out_time FROM attendance WHERE staff_id = $1 AND date LIKE $2 AND hotel_id = $3",
+      [staff_id, `${month}%`, req.hotel_id],
+    );
+
+    let totalPresentDays = 0;
+    attRes.rows.forEach((row) => {
+      if (row.in_time && row.out_time) {
+        const duration =
+          (parseTime(row.out_time) - parseTime(row.in_time)) / 60; // in hours
+        if (duration >= fullDayHours) totalPresentDays += 1;
+        else if (duration >= halfDayHours) totalPresentDays += 0.5;
+      }
+    });
+
+    // 4. Get Advances
+    const advRes = await pool.query(
+      "SELECT SUM(amount) as total FROM staff_advances WHERE staff_id = $1 AND is_deducted = 0 AND hotel_id = $2",
+      [staff_id, req.hotel_id],
+    );
+    const totalAdvance = parseFloat(advRes.rows[0].total) || 0;
+
+    const earned = Math.round(totalPresentDays * oneDaySalary);
+    const finalPayout = earned - totalAdvance;
+
+    res.json({
+      month: month,
+      base_salary: user.salary,
+      present_days: totalPresentDays,
+      earned_amount: earned,
+      advance_deducted: totalAdvance,
+      final_payout: finalPayout > 0 ? finalPayout : 0,
+    });
+  } catch (err) {
+    res.json(null);
+  }
+});
+
+app.post("/api/finalize_salary", async (req, res) => {
+  const {
+    staff_id,
+    month,
+    base_salary,
+    present_days,
+    earned_amount,
+    advance_deducted,
+    final_payout,
+  } = req.body;
+  try {
+    await pool.query("BEGIN");
+
+    await pool.query(
+      `INSERT INTO payroll (hotel_id, staff_id, month_year, base_salary, present_days, earned_amount, advance_deducted, final_payout, payment_date) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        req.hotel_id,
+        staff_id,
+        month,
+        base_salary,
+        present_days,
+        earned_amount,
+        advance_deducted,
+        final_payout,
+        new Date().toISOString().split("T")[0],
+      ],
+    );
+
+    await pool.query(
+      "UPDATE staff_advances SET is_deducted = 1 WHERE staff_id = $1 AND is_deducted = 0 AND hotel_id = $2",
+      [staff_id, req.hotel_id],
+    );
+
+    await pool.query("COMMIT");
+    res.json({ status: true, message: "Salary Paid & Recorded!" });
+  } catch (err) {
+    await pool.query("ROLLBACK");
+    res.json({ status: false, message: err.message });
+  }
+});
+
+// ==========================================
+// 👥 16. CLIENT MANAGEMENT API
+// ==========================================
+app.get("/clients", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM clients WHERE hotel_id = $1 ORDER BY id DESC",
+      [req.hotel_id],
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/save_client", async (req, res) => {
+  const { name, mobile, address, aadhar } = req.body;
+  try {
+    const check = await pool.query(
+      "SELECT id FROM clients WHERE mobile = $1 AND hotel_id = $2",
+      [mobile, req.hotel_id],
+    );
+    if (check.rows.length > 0) {
+      await pool.query(
+        "UPDATE clients SET name=$1, address=$2, aadhar=$3 WHERE mobile=$4 AND hotel_id=$5",
+        [name, address, aadhar, mobile, req.hotel_id],
+      );
+    } else {
+      await pool.query(
+        "INSERT INTO clients (hotel_id, name, mobile, address, aadhar) VALUES ($1, $2, $3, $4, $5)",
+        [req.hotel_id, name, mobile, address, aadhar],
+      );
+    }
+    res.json({ message: "Client Saved" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/client_history", async (req, res) => {
+  const mobile = req.query.mobile;
+  if (!mobile) return res.json([]);
+  try {
+    const query = `
+      SELECT bill_no, bill_date as date, bill_time, total as amount, bill_type as type, 
+      location as room_no, check_in, guests_json as other_guests, items_json as items_summary 
+      FROM bill_history WHERE mobile = $1 AND hotel_id = $2 ORDER BY id DESC
+    `;
+    const result = await pool.query(query, [mobile, req.hotel_id]);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================
+// 📊 17. TALLY XML EXPORT (CA SPECIAL)
+// ==========================================
+app.get("/api/export/tally", async (req, res) => {
+  const { from, to } = req.query;
+
+  try {
+    const salesRes = await pool.query(
+      "SELECT * FROM bill_history WHERE hotel_id = $1 AND bill_date >= $2 AND bill_date <= $3",
+      [req.hotel_id, from, to],
+    );
+    const expRes = await pool.query(
+      "SELECT * FROM expenses WHERE hotel_id = $1 AND date >= $2 AND date <= $3",
+      [req.hotel_id, from, to],
+    );
+
+    let xml = `<ENVELOPE>\n<HEADER>\n<TALLYREQUEST>Import Data</TALLYREQUEST>\n</HEADER>\n<BODY>\n<IMPORTDATA>\n<REQUESTDESC>\n<REPORTNAME>Vouchers</REPORTNAME>\n</REQUESTDESC>\n<REQUESTDATA>\n`;
+
+    // Sales XML
+    salesRes.rows.forEach((sale) => {
+      let cleanDate = sale.bill_date ? sale.bill_date.replace(/-/g, "") : "";
+      xml += `<TALLYMESSAGE xmlns:UDF="TallyUDF">\n<VOUCHER VCHTYPE="Sales" ACTION="Create">\n`;
+      xml += `<DATE>${cleanDate}</DATE>\n`;
+      xml += `<VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>\n`;
+      xml += `<VOUCHERNUMBER>${sale.bill_no}</VOUCHERNUMBER>\n`;
+      xml += `<PARTYLEDGERNAME>Cash</PARTYLEDGERNAME>\n`;
+      xml += `<ALLLEDGERENTRIES.LIST>\n<LEDGERNAME>Sales Account</LEDGERNAME>\n<ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>\n<AMOUNT>${sale.total}</AMOUNT>\n</ALLLEDGERENTRIES.LIST>\n`;
+      xml += `</VOUCHER>\n</TALLYMESSAGE>\n`;
+    });
+
+    // Expenses XML
+    expRes.rows.forEach((exp) => {
+      let cleanDate = exp.date ? exp.date.replace(/-/g, "") : "";
+      xml += `<TALLYMESSAGE xmlns:UDF="TallyUDF">\n<VOUCHER VCHTYPE="Payment" ACTION="Create">\n`;
+      xml += `<DATE>${cleanDate}</DATE>\n`;
+      xml += `<VOUCHERTYPENAME>Payment</VOUCHERTYPENAME>\n`;
+      xml += `<PARTYLEDGERNAME>${exp.category}</PARTYLEDGERNAME>\n`;
+      xml += `<ALLLEDGERENTRIES.LIST>\n<LEDGERNAME>Cash</LEDGERNAME>\n<ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>\n<AMOUNT>${exp.amount}</AMOUNT>\n</ALLLEDGERENTRIES.LIST>\n`;
+      xml += `</VOUCHER>\n</TALLYMESSAGE>\n`;
+    });
+
+    xml += `</REQUESTDATA>\n</IMPORTDATA>\n</BODY>\n</ENVELOPE>`;
+
+    res.header("Content-Type", "application/xml");
+    res.attachment(`Tally_Export_${from}_to_${to}.xml`);
+    res.send(xml);
+  } catch (err) {
+    res.status(500).send("Database Error");
+  }
+});
+
+// ==========================================
+// 🤖 18. AI ANALYTICS & INSIGHTS
+// ==========================================
+app.get("/api/analytics/ai-insights", async (req, res) => {
+  let insights = [];
+  const today = new Date().toISOString().split("T")[0];
+
+  try {
+    // 1. Trending Item
+    const topRes = await pool.query(
+      "SELECT item_name, SUM(qty) as total_qty FROM kitchen_orders WHERE hotel_id = $1 AND order_date = $2 GROUP BY item_name ORDER BY total_qty DESC LIMIT 1",
+      [req.hotel_id, today],
+    );
+    if (topRes.rows.length > 0) {
+      insights.push({
+        type: "success",
+        text: `🚀 Trending: '${topRes.rows[0].item_name}' is your best seller today.`,
+      });
+    }
+
+    // 2. High Expense Alert
+    const expRes = await pool.query(
+      "SELECT SUM(amount) as total_exp FROM expenses WHERE hotel_id = $1 AND date = $2",
+      [req.hotel_id, today],
+    );
+    if (expRes.rows[0].total_exp > 1000) {
+      insights.push({
+        type: "warning",
+        text: `⚠️ Alert: Today's expenses are high (₹${expRes.rows[0].total_exp}).`,
+      });
+    }
+
+    // 3. Pending Orders
+    const penRes = await pool.query(
+      "SELECT COUNT(*) as count FROM kitchen_orders WHERE hotel_id = $1 AND status = 'PENDING'",
+      [req.hotel_id],
+    );
+    const pending = parseInt(penRes.rows[0].count);
+    if (pending > 5) {
+      insights.push({
+        type: "danger",
+        text: `⏳ Speed Up: ${pending} orders waiting in kitchen!`,
+      });
+    } else if (pending === 0) {
+      insights.push({
+        type: "success",
+        text: `✅ Kitchen is clear. Good job team!`,
+      });
+    }
+
+    if (insights.length === 0) {
+      insights.push({ type: "success", text: `🌟 System running smoothly.` });
+    }
+    res.json({ success: true, insights: insights });
+  } catch (err) {
+    res.json({
+      success: false,
+      insights: [{ type: "success", text: `🌟 System running smoothly.` }],
+    });
+  }
+});
+
+// ==========================================
+// 📊 19. EXCEL REPORT GENERATOR
+// ==========================================
+const ExcelJS = require("exceljs");
+
+app.post("/api/generate-excel-report", async (req, res) => {
+  try {
+    const { data, type } = req.body;
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Report");
+
+    if (data.length > 0) {
+      // Generate Headers dynamically from the first object
+      const headers = Object.keys(data[0]).map((key) => ({
+        header: key.toUpperCase(),
+        key: key,
+        width: 20,
+      }));
+      worksheet.columns = headers;
+
+      // Add Data
+      data.forEach((item) => worksheet.addRow(item));
+      worksheet.getRow(1).font = { bold: true };
+    }
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=${type}_Report.xlsx`,
+    );
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    res.status(500).json({ error: "Excel Generation Failed" });
+  }
+});
+
+// ==========================================
+// 🛵 20. ZOMATO / SWIGGY & OTA WEBHOOKS
+// ==========================================
+app.post("/api/delivery_partners/save", async (req, res) => {
+  const { name, api_key, status } = req.body;
+  const cleanName = name.trim().toUpperCase();
+  try {
+    await pool.query(
+      `INSERT INTO delivery_partners (hotel_id, name, api_key, status) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (name) DO UPDATE SET api_key = EXCLUDED.api_key, status = EXCLUDED.status`,
+      [req.hotel_id, cleanName, api_key, status],
+    );
+    res.json({ success: true, message: "Partner Saved" });
+  } catch (err) {
+    res.status(500).json({ success: false });
+  }
+});
+
+app.post("/api/ota/webhook", async (req, res) => {
+  const {
+    ota_name,
+    guest_name,
+    check_in,
+    check_out,
+    room_type,
+    total_price,
+    hotel_id,
+  } = req.body;
+  const targetHotel = hotel_id || req.hotel_id; // Webhook bahar se aayega, usme hotel_id zaroor hona chahiye!
+
+  if (!targetHotel)
+    return res.status(403).json({ error: "Missing hotel_id in webhook" });
+
+  try {
+    await pool.query(
+      `INSERT INTO advance_bookings (hotel_id, room_no, guest_name, mobile, check_in_date, check_out_date, advance_amount, status) 
+       VALUES ($1, 'TBD', $2, 'OTA Booking', $3, $4, $5, 'CONFIRMED')`,
+      [targetHotel, guest_name, check_in, check_out, total_price],
+    );
+    res.json({ status: "success", message: "OTA Booking Saved!" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Health Check for Render
 app.get("/", (req, res) => {
   res.send("<h1>🚀 HotelOS Master Cloud API is LIVE!</h1>");

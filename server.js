@@ -109,10 +109,19 @@ initializeDatabase();
 // ==========================================
 // 🛡️ 5. MIDDLEWARE: EXTRACT HOTEL ID
 // ==========================================
-// Ab har API call me client ko apna 'hotel_id' bhejna hoga
+
+// Render ke Health Check ke liye rasta (Taaki server crash na ho)
+app.get("/", (req, res) => {
+  res.send("<h1>🚀 HotelOS Cloud API is LIVE & Running!</h1>");
+});
+
+// Security Guard (Middleware)
 app.use((req, res, next) => {
+  // Safe extraction taaki undefined error na aaye
   req.hotel_id =
-    req.headers["x-hotel-id"] || req.body.hotel_id || req.query.hotel_id;
+    req.headers["x-hotel-id"] ||
+    (req.body && req.body.hotel_id) ||
+    req.query.hotel_id;
 
   // Agar setup/login route nahi hai, aur hotel_id gayab hai, to reject karo
   if (!req.hotel_id && !req.path.includes("/login")) {
